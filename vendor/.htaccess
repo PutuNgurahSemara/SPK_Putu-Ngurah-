@@ -1,0 +1,6 @@
+# Blokir akses langsung ke folder vendor
+Options -Indexes
+<FilesMatch ".*">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>

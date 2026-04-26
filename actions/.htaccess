@@ -1,0 +1,13 @@
+# ============================================================
+# .htaccess — Keamanan folder actions/ & exports/
+# Mencegah akses langsung ke folder ini via browser
+# kecuali dari referrer yang benar
+# ============================================================
+
+# Tolak akses langsung ke folder actions/ (hanya boleh POST dari form)
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # Redirect ke halaman utama jika bukan POST request
+    RewriteCond %{REQUEST_METHOD} !POST
+    RewriteRule ^$ ../index.php [R=302,L]
+</IfModule>
