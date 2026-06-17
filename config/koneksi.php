@@ -37,7 +37,6 @@ function getDB(): \PDO
             $pdo = new \PDO($dsn, DB_USER, DB_PASS, $options);
         } catch (\PDOException $e) {
             error_log('[DB Connection Error] ' . $e->getMessage());
-            // Tampilkan halaman error yang aman (tidak bocorkan detail)
             http_response_code(503);
             die('<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8">
                 <title>Error Koneksi</title>
@@ -55,54 +54,56 @@ function getDB(): \PDO
 }
 
 // ============================================================
-// FUNGSI HELPER: AMBIL BOBOT KRITERIA DARI DATABASE (DINAMIS)
-// Bobot tidak di-hardcode — selalu diambil fresh dari tabel `kriteria`
+// FUNGSI HELPER: AMBIL DATA KRITERIA DARI DATABASE (DINAMIS)
+// Tidak ada hardcode kode/kolom — semua dari tabel `kriteria`
 // ============================================================
 
 /**
- * Mengambil semua data kriteria beserta bobotnya dari database.
- * Return array asosiatif: ['c1_usia' => 0.15, 'c2_kerusakan' => 0.30, ...]
+ * Mengambil semua data kriteria lengkap, diurutkan berdasarkan urutan/kode.
  *
- * @return array<string, float>
- */
-function getBobotKriteria(): array
-{
-    // Map kode_kriteria → nama kolom di tabel penilaian_spk
-    $kodeToKolom = [
-        'C1' => 'c1_usia',
-        'C2' => 'c2_kerusakan',
-        'C3' => 'c3_part',
-        'C4' => 'c4_kompleksitas',
-        'C5' => 'c5_garansi',
-    ];
-
-    $stmt = getDB()->query(
-        "SELECT kode_kriteria, bobot FROM kriteria ORDER BY kode_kriteria ASC"
-    );
-    $rows  = $stmt->fetchAll();
-    $bobot = [];
-
-    foreach ($rows as $row) {
-        $kode = strtoupper(trim($row['kode_kriteria']));
-        if (isset($kodeToKolom[$kode])) {
-            $bobot[$kodeToKolom[$kode]] = (float) $row['bobot'];
-        }
-    }
-
-    return $bobot;
-}
-
-/**
- * Mengambil semua data kriteria lengkap (untuk halaman Pengaturan Bobot).
- *
- * @return array
+ * @return array<int, array<string, mixed>>
  */
 function getAllKriteria(): array
 {
     $stmt = getDB()->query(
-        "SELECT * FROM kriteria ORDER BY kode_kriteria ASC"
+        "SELECT * FROM kriteria ORDER BY urutan, kode_kriteria ASC"
     );
     return $stmt->fetchAll();
+}
+
+/**
+ * Mengambil bobot per kriteria_id (bukan per nama kolom).
+ * Return: [kriteria_id => bobot_float]
+ *
+ * @return array<int, float>
+ */
+function getBobotKriteria(): array
+{
+    $stmt = getDB()->query(
+        "SELECT id, bobot FROM kriteria ORDER BY urutan, kode_kriteria ASC"
+    );
+    $bobot = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $bobot[(int)$row['id']] = (float)$row['bobot'];
+    }
+    return $bobot;
+}
+
+/**
+ * Auto-generate kode kriteria berikutnya (C1, C2, ..., Cn).
+ * Mencari angka tertinggi yang sudah ada lalu +1.
+ *
+ * @return string  Contoh: 'C6'
+ */
+function generateNextKodeKriteria(): string
+{
+    $stmt = getDB()->query(
+        "SELECT MAX(CAST(REGEXP_REPLACE(kode_kriteria, '[^0-9]', '', 'g') AS INTEGER))
+         FROM kriteria
+         WHERE kode_kriteria ~ '^C[0-9]+$'"
+    );
+    $maxNum = (int)($stmt->fetchColumn() ?? 0);
+    return 'C' . ($maxNum + 1);
 }
 
 // ============================================================
@@ -115,31 +116,5 @@ define('SAW_THRESHOLD', 0.70);
 /** Jenis perangkat yang valid (sesuai CHECK constraint di DB) */
 define('JENIS_PERANGKAT', ['Thin Client', 'PC Desktop', 'Printer', 'Network']);
 
-/** Skala nilai dropdown per kriteria (label deskriptif untuk user) */
-define('SAW_SKALA', [
-    'c1_usia' => [
-        1 => '1 — Di bawah 3 tahun',
-        2 => '2 — Antara 3 sampai 5 tahun',
-        3 => '3 — Di atas 5 tahun',
-    ],
-    'c2_kerusakan' => [
-        1 => '1 — Kerusakan Ringan',
-        2 => '2 — Kerusakan Sedang',
-        3 => '3 — Kerusakan Berat',
-    ],
-    'c3_part' => [
-        1 => '1 — Suku Cadang Mudah Didapat',
-        2 => '2 — Suku Cadang Sulit Didapat',
-        3 => '3 — Suku Cadang Tidak Tersedia',
-    ],
-    'c4_kompleksitas' => [
-        1 => '1 — Pengerjaan Mudah',
-        2 => '2 — Pengerjaan Sedang',
-        3 => '3 — Pengerjaan Sulit / Kompleks',
-    ],
-    'c5_garansi' => [
-        1 => '1 — Garansi Masih Aktif',
-        2 => '2 — Garansi Habis < 1 Tahun',
-        3 => '3 — Garansi Habis > 1 Tahun',
-    ],
-]);
+// Catatan: SAW_SKALA dihapus — skala nilai kini dinamis dari kolom
+// nilai_1, nilai_2, nilai_3 di tabel kriteria

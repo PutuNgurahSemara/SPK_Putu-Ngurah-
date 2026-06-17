@@ -1,22 +1,25 @@
 <?php
 // ============================================================
-// pages/hasil.php — Halaman Hasil Keputusan SPK (Ranking)
+// pages/hasil.php — Halaman Hasil Keputusan SPK (v2 Dinamis)
 // Menampilkan ranking skor tertinggi → terendah + Export
+// Kolom kriteria dinamis sesuai jumlah kriteria di DB
 // ============================================================
 declare(strict_types=1);
 
 $db = getDB();
 
-// ── Filter ────────────────────────────────────────────────
-$filterRek = $_GET['rek'] ?? 'semua';
-$validFilters = ['semua', 'Servis', 'Masuk Gudang', 'belum'];
+// ── Ambil Semua Kriteria (untuk header kolom) ──────────────
+$semuaKriteria = getAllKriteria();
 
+// ── Filter ────────────────────────────────────────────────
+$filterRek    = $_GET['rek'] ?? 'semua';
+$validFilters = ['semua', 'Servis', 'Masuk Gudang', 'belum'];
 if (!in_array($filterRek, $validFilters, true)) {
     $filterRek = 'semua';
 }
 
 // ── Query Ranking ─────────────────────────────────────────
-// Ambil penilaian terbaru per perangkat (DISTINCT ON = PostgreSQL)
+// Ambil penilaian terbaru per perangkat dengan nilai JSON per kriteria
 $whereClause = '';
 $params      = [];
 
@@ -35,21 +38,24 @@ $sql = "
         p.jenis_perangkat,
         p.divisi_user,
         ps.id           AS penilaian_id,
-        ps.c1_usia,
-        ps.c2_kerusakan,
-        ps.c3_part,
-        ps.c4_kompleksitas,
-        ps.c5_garansi,
         ps.skor_akhir,
         ps.rekomendasi,
-        ps.tanggal_penilaian
+        ps.tanggal_penilaian,
+        COALESCE(
+            json_object_agg(pd.kriteria_id::text, pd.nilai)
+            FILTER (WHERE pd.kriteria_id IS NOT NULL),
+            '{}'::json
+        ) AS nilai_json
     FROM (
         SELECT DISTINCT ON (perangkat_id) *
         FROM penilaian_spk
         ORDER BY perangkat_id, tanggal_penilaian DESC
     ) ps
     JOIN perangkat p ON p.id = ps.perangkat_id
+    LEFT JOIN penilaian_detail pd ON pd.penilaian_id = ps.id
     {$whereClause}
+    GROUP BY p.id, p.kode_aset, p.jenis_perangkat, p.divisi_user,
+             ps.id, ps.skor_akhir, ps.rekomendasi, ps.tanggal_penilaian
     ORDER BY ps.skor_akhir DESC NULLS LAST
 ";
 
@@ -57,15 +63,21 @@ $stmt = $db->prepare($sql);
 $stmt->execute($params);
 $hasilList = $stmt->fetchAll();
 
+// Decode nilai_json untuk setiap baris
+foreach ($hasilList as &$row) {
+    $row['nilai_map'] = json_decode($row['nilai_json'] ?? '{}', true) ?? [];
+}
+unset($row);
+
 // ── Statistik ringkas ──────────────────────────────────────
 $stmtStat = $db->query("
     SELECT
-        COUNT(*)                                           AS total,
-        COUNT(*) FILTER (WHERE rekomendasi = 'Servis')    AS servis,
+        COUNT(*)                                              AS total,
+        COUNT(*) FILTER (WHERE rekomendasi = 'Servis')       AS servis,
         COUNT(*) FILTER (WHERE rekomendasi = 'Masuk Gudang') AS gudang,
-        ROUND(AVG(skor_akhir)::numeric, 4)                AS avg_skor,
-        MAX(skor_akhir)                                    AS max_skor,
-        MIN(skor_akhir)                                    AS min_skor
+        ROUND(AVG(skor_akhir)::numeric, 4)                   AS avg_skor,
+        MAX(skor_akhir)                                       AS max_skor,
+        MIN(skor_akhir)                                       AS min_skor
     FROM (
         SELECT DISTINCT ON (perangkat_id) rekomendasi, skor_akhir
         FROM penilaian_spk
@@ -81,6 +93,7 @@ $stat = $stmtStat->fetch();
         <p class="text-slate-400 text-sm mt-1">
             Ranking berdasarkan skor SAW tertinggi. Threshold rekomendasi:
             <span class="text-blue-400 font-mono font-semibold"><?= SAW_THRESHOLD ?></span>
+            &nbsp;|&nbsp; <?= count($semuaKriteria) ?> kriteria aktif
         </p>
     </div>
     <!-- Tombol Export -->
@@ -112,12 +125,12 @@ $stat = $stmtStat->fetch();
 <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
     <?php
     $miniStats = [
-        ['label' => 'Total Dinilai',  'val' => $stat['total'] ?? 0,    'color' => 'text-white'],
-        ['label' => 'Servis',         'val' => $stat['servis'] ?? 0,   'color' => 'text-amber-400'],
-        ['label' => 'Masuk Gudang',   'val' => $stat['gudang'] ?? 0,   'color' => 'text-red-400'],
-        ['label' => 'Rata-rata Skor', 'val' => number_format((float)($stat['avg_skor'] ?? 0), 4), 'color' => 'text-blue-400'],
-        ['label' => 'Skor Tertinggi', 'val' => number_format((float)($stat['max_skor'] ?? 0), 4), 'color' => 'text-green-400'],
-        ['label' => 'Skor Terendah',  'val' => number_format((float)($stat['min_skor'] ?? 0), 4), 'color' => 'text-slate-400'],
+        ['label' => 'Total Dinilai',  'val' => $stat['total'] ?? 0,                                       'color' => 'text-white'],
+        ['label' => 'Servis',         'val' => $stat['servis'] ?? 0,                                      'color' => 'text-amber-400'],
+        ['label' => 'Masuk Gudang',   'val' => $stat['gudang'] ?? 0,                                      'color' => 'text-red-400'],
+        ['label' => 'Rata-rata Skor', 'val' => number_format((float)($stat['avg_skor'] ?? 0), 4),         'color' => 'text-blue-400'],
+        ['label' => 'Skor Tertinggi', 'val' => number_format((float)($stat['max_skor'] ?? 0), 4),         'color' => 'text-green-400'],
+        ['label' => 'Skor Terendah',  'val' => number_format((float)($stat['min_skor'] ?? 0), 4),         'color' => 'text-slate-400'],
     ];
     foreach ($miniStats as $ms):
     ?>
@@ -133,10 +146,10 @@ $stat = $stmtStat->fetch();
     <span class="text-slate-400 text-xs font-medium">Filter:</span>
     <?php
     $filterOptions = [
-        'semua'       => ['label' => 'Semua',        'class' => 'bg-slate-600 text-white'],
-        'Servis'      => ['label' => 'Servis',        'class' => 'bg-amber-700 text-amber-100'],
-        'Masuk Gudang'=> ['label' => 'Masuk Gudang',  'class' => 'bg-red-700 text-red-100'],
-        'belum'       => ['label' => 'Belum Dihitung','class' => 'bg-slate-700 text-slate-300'],
+        'semua'        => ['label' => 'Semua',         'class' => 'bg-slate-600 text-white'],
+        'Servis'       => ['label' => 'Servis',         'class' => 'bg-amber-700 text-amber-100'],
+        'Masuk Gudang' => ['label' => 'Masuk Gudang',   'class' => 'bg-red-700 text-red-100'],
+        'belum'        => ['label' => 'Belum Dihitung', 'class' => 'bg-slate-700 text-slate-300'],
     ];
     foreach ($filterOptions as $val => $opt):
         $isActive = $filterRek === $val;
@@ -154,32 +167,32 @@ $stat = $stmtStat->fetch();
 
 <!-- ── Tabel Ranking ──────────────────────────────────────── -->
 <div class="bg-slate-800 border border-slate-700/60 rounded-2xl overflow-hidden">
-
-    <!-- Header -->
     <div class="overflow-x-auto">
-    <table class="w-full min-w-[900px]">
+    <table class="w-full">
         <thead>
             <tr class="bg-slate-700/40 border-b border-slate-700/60 text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                <th class="px-4 py-3 text-center w-12">#</th>
-                <th class="px-4 py-3 text-left">Kode Aset</th>
-                <th class="px-4 py-3 text-left">Jenis</th>
-                <th class="px-4 py-3 text-left">Divisi</th>
-                <th class="px-3 py-3 text-center w-10" title="C1: Usia">C1</th>
-                <th class="px-3 py-3 text-center w-10" title="C2: Kerusakan">C2</th>
-                <th class="px-3 py-3 text-center w-10" title="C3: Suku Cadang">C3</th>
-                <th class="px-3 py-3 text-center w-10" title="C4: Kompleksitas">C4</th>
-                <th class="px-3 py-3 text-center w-10" title="C5: Garansi">C5</th>
-                <th class="px-4 py-3 text-center">Skor SAW</th>
-                <th class="px-4 py-3 text-center">Rekomendasi</th>
-                <th class="px-4 py-3 text-center">Tanggal</th>
-                <th class="px-4 py-3 text-center">Aksi</th>
+                <th class="px-4 py-3 text-center w-10">#</th>
+                <th class="px-4 py-3 text-left whitespace-nowrap">Kode Aset</th>
+                <th class="px-4 py-3 text-left whitespace-nowrap">Jenis</th>
+                <th class="px-4 py-3 text-left whitespace-nowrap">Divisi</th>
+                <!-- Kolom kriteria — dinamis -->
+                <?php foreach ($semuaKriteria as $kr): ?>
+                <th class="px-3 py-3 text-center w-10 whitespace-nowrap"
+                    title="<?= htmlspecialchars($kr['kode_kriteria']) ?>: <?= htmlspecialchars($kr['nama_kriteria']) ?>">
+                    <?= htmlspecialchars($kr['kode_kriteria']) ?>
+                </th>
+                <?php endforeach; ?>
+                <th class="px-4 py-3 text-center whitespace-nowrap">Skor SAW</th>
+                <th class="px-4 py-3 text-center whitespace-nowrap">Rekomendasi</th>
+                <th class="px-4 py-3 text-center whitespace-nowrap">Tanggal</th>
+                <th class="px-4 py-3 text-center whitespace-nowrap">Aksi</th>
             </tr>
         </thead>
         <tbody class="divide-y divide-slate-700/40">
 
         <?php if (empty($hasilList)): ?>
             <tr>
-                <td colspan="13" class="px-4 py-16 text-center text-slate-500">
+                <td colspan="<?= 8 + count($semuaKriteria) ?>" class="px-4 py-16 text-center text-slate-500">
                     <svg class="w-12 h-12 mx-auto mb-3 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
                               d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
@@ -196,24 +209,20 @@ $stat = $stmtStat->fetch();
             $isServis = $row['rekomendasi'] === 'Servis';
             $rank     = (int)$row['ranking'];
 
-            // Warna baris berdasarkan ranking tertinggi
             $rowHighlight = '';
             if ($rank === 1)     $rowHighlight = 'bg-red-900/10';
             elseif ($rank === 2) $rowHighlight = 'bg-red-900/5';
 
-            // Badge rekomendasi
             $rekBadge = match($row['rekomendasi']) {
                 'Masuk Gudang' => 'bg-red-900/50 text-red-300 border border-red-700/50',
                 'Servis'       => 'bg-amber-900/50 text-amber-300 border border-amber-700/50',
                 default        => 'bg-slate-700 text-slate-400 border border-slate-600',
             };
 
-            // Warna nilai kriteria (1=green, 2=amber, 3=red)
             $nilaiColor = fn($v) => match((int)$v) {
-                1 => 'text-green-400', 2 => 'text-amber-400', 3 => 'text-red-400', default => 'text-slate-400'
+                1 => 'text-green-400', 2 => 'text-amber-400', 3 => 'text-red-400', default => 'text-slate-500'
             };
 
-            // Warna skor progress bar
             $skor    = (float)($row['skor_akhir'] ?? 0);
             $skorPct = round($skor * 100);
             $barColor = $skor >= SAW_THRESHOLD ? 'bg-red-500' : 'bg-amber-500';
@@ -248,12 +257,19 @@ $stat = $stmtStat->fetch();
                 <span class="text-slate-400 text-xs"><?= htmlspecialchars($row['divisi_user']) ?></span>
             </td>
 
-            <!-- C1–C5 Nilai -->
-            <?php foreach (['c1_usia','c2_kerusakan','c3_part','c4_kompleksitas','c5_garansi'] as $col): ?>
+            <!-- Nilai per Kriteria (dinamis) -->
+            <?php foreach ($semuaKriteria as $kr):
+                $kid   = (string)$kr['id'];
+                $nilai = $row['nilai_map'][$kid] ?? null;
+            ?>
             <td class="px-3 py-3 text-center">
-                <span class="text-sm font-bold font-mono <?= $nilaiColor($row[$col]) ?>">
-                    <?= $row[$col] ?? '—' ?>
+                <?php if ($nilai !== null): ?>
+                <span class="text-sm font-bold font-mono <?= $nilaiColor((int)$nilai) ?>">
+                    <?= (int)$nilai ?>
                 </span>
+                <?php else: ?>
+                <span class="text-slate-600 text-xs">—</span>
+                <?php endif; ?>
             </td>
             <?php endforeach; ?>
 
@@ -312,9 +328,12 @@ $stat = $stmtStat->fetch();
     </table>
     </div>
 
-    <!-- Legend -->
-    <div class="px-5 py-3 border-t border-slate-700/50 flex flex-wrap gap-4 text-xs text-slate-500">
-        <span>C1=Usia &nbsp; C2=Kerusakan &nbsp; C3=Suku Cadang &nbsp; C4=Kompleksitas &nbsp; C5=Garansi</span>
+    <!-- Legend Kriteria (dinamis) -->
+    <div class="px-5 py-3 border-t border-slate-700/50 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+        <span class="font-medium text-slate-400">Keterangan:</span>
+        <?php foreach ($semuaKriteria as $kr): ?>
+        <span><?= htmlspecialchars($kr['kode_kriteria']) ?>=<?= htmlspecialchars($kr['nama_kriteria']) ?></span>
+        <?php endforeach; ?>
         <span class="ml-auto">
             <span class="text-green-400 font-mono">1</span>=Baik &ensp;
             <span class="text-amber-400 font-mono">2</span>=Sedang &ensp;

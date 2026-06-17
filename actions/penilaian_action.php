@@ -1,7 +1,7 @@
 <?php
 // ============================================================
-// actions/penilaian_action.php — Handler POST Form Penilaian SPK
-// Menyimpan nilai C1–C5, lalu jalankan SawEngine.hitungUlangSemua()
+// actions/penilaian_action.php — Handler POST Form Penilaian SPK (v2)
+// Menyimpan nilai per kriteria ke penilaian_detail, lalu SawEngine
 // ============================================================
 declare(strict_types=1);
 
@@ -25,27 +25,36 @@ function redirectFlash(string $page, string $type, string $msg): void
 $db = getDB();
 
 // ── Ambil & Validasi Input ────────────────────────────────
-$perangkatId     = (int)($_POST['perangkat_id']   ?? 0);
-$c1              = (int)($_POST['c1_usia']         ?? 0);
-$c2              = (int)($_POST['c2_kerusakan']    ?? 0);
-$c3              = (int)($_POST['c3_part']          ?? 0);
-$c4              = (int)($_POST['c4_kompleksitas'] ?? 0);
-$c5              = (int)($_POST['c5_garansi']      ?? 0);
+$perangkatId = (int)($_POST['perangkat_id'] ?? 0);
+$nilaiInput  = $_POST['nilai'] ?? []; // [kriteria_id => nilai(1-3)]
 
 // Validasi ID perangkat
 if ($perangkatId <= 0) {
     redirectFlash('penilaian', 'error', 'Perangkat wajib dipilih.');
 }
 
-// Validasi semua nilai ada dan dalam rentang 1-3
-$nilaiKriteria = [$c1, $c2, $c3, $c4, $c5];
-foreach ($nilaiKriteria as $val) {
-    if ($val < 1 || $val > 3) {
-        redirectFlash('penilaian', 'error', 'Semua nilai kriteria harus dipilih (skala 1–3).');
-    }
+// Ambil semua kriteria aktif dari DB
+$semuaKriteria = getAllKriteria();
+if (empty($semuaKriteria)) {
+    redirectFlash('penilaian', 'error', 'Belum ada kriteria aktif. Tambahkan kriteria di halaman Pengaturan Bobot.');
 }
 
-// Cek perangkat benar-benar ada di database
+// Validasi: semua kriteria harus diisi dengan nilai 1-3
+$nilaiValid = [];
+foreach ($semuaKriteria as $kr) {
+    $kid = (int)$kr['id'];
+    $val = (int)($nilaiInput[$kid] ?? 0);
+    if ($val < 1 || $val > 3) {
+        redirectFlash(
+            'penilaian',
+            'error',
+            "Nilai untuk kriteria {$kr['kode_kriteria']} ({$kr['nama_kriteria']}) wajib dipilih (skala 1–3)."
+        );
+    }
+    $nilaiValid[$kid] = $val;
+}
+
+// Cek perangkat ada di database
 $stmtCek = $db->prepare("SELECT id, kode_aset FROM perangkat WHERE id = :id");
 $stmtCek->execute([':id' => $perangkatId]);
 $perangkat = $stmtCek->fetch();
@@ -58,7 +67,7 @@ if (!$perangkat) {
 try {
     $db->beginTransaction();
 
-    // Cek apakah sudah pernah dinilai (ambil penilaian terbaru)
+    // Cek apakah sudah pernah dinilai (penilaian terbaru)
     $stmtCekExist = $db->prepare("
         SELECT id FROM penilaian_spk
         WHERE perangkat_id = :pid
@@ -69,55 +78,59 @@ try {
     $existingId = $stmtCekExist->fetchColumn();
 
     if ($existingId) {
-        // UPDATE penilaian yang sudah ada
-        $stmt = $db->prepare("
+        // UPDATE header penilaian (reset skor & rek)
+        $db->prepare("
             UPDATE penilaian_spk
-               SET c1_usia         = :c1,
-                   c2_kerusakan    = :c2,
-                   c3_part          = :c3,
-                   c4_kompleksitas  = :c4,
-                   c5_garansi       = :c5,
-                   tanggal_penilaian = CURRENT_TIMESTAMP,
-                   skor_akhir       = NULL,
-                   rekomendasi      = NULL
+               SET tanggal_penilaian = CURRENT_TIMESTAMP,
+                   skor_akhir        = NULL,
+                   rekomendasi       = NULL
              WHERE id = :id
-        ");
-        $stmt->execute([
-            ':c1' => $c1, ':c2' => $c2, ':c3' => $c3,
-            ':c4' => $c4, ':c5' => $c5, ':id' => (int)$existingId,
-        ]);
-        $opLabel = 'diperbarui';
+        ")->execute([':id' => (int)$existingId]);
+
+        // Hapus detail lama lalu insert baru
+        $db->prepare("DELETE FROM penilaian_detail WHERE penilaian_id = :pid")
+           ->execute([':pid' => (int)$existingId]);
+
+        $penilaianId = (int)$existingId;
+        $opLabel     = 'diperbarui';
     } else {
-        // INSERT penilaian baru
-        $stmt = $db->prepare("
-            INSERT INTO penilaian_spk
-                   (perangkat_id, c1_usia, c2_kerusakan, c3_part, c4_kompleksitas, c5_garansi)
-            VALUES (:pid, :c1, :c2, :c3, :c4, :c5)
-        ");
-        $stmt->execute([
-            ':pid' => $perangkatId,
-            ':c1'  => $c1, ':c2' => $c2, ':c3' => $c3,
-            ':c4'  => $c4, ':c5' => $c5,
+        // INSERT header penilaian baru
+        $db->prepare("
+            INSERT INTO penilaian_spk (perangkat_id)
+            VALUES (:pid)
+        ")->execute([':pid' => $perangkatId]);
+
+        $penilaianId = (int)$db->lastInsertId();
+        $opLabel     = 'ditambahkan';
+    }
+
+    // Insert nilai per kriteria ke penilaian_detail
+    $stmtDetail = $db->prepare("
+        INSERT INTO penilaian_detail (penilaian_id, kriteria_id, nilai)
+        VALUES (:pid, :kid, :nilai)
+    ");
+
+    foreach ($nilaiValid as $kid => $val) {
+        $stmtDetail->execute([
+            ':pid'   => $penilaianId,
+            ':kid'   => $kid,
+            ':nilai' => $val,
         ]);
-        $opLabel = 'ditambahkan';
     }
 
     // ── Jalankan SAW Engine: hitung ulang SEMUA skor ──────
-    // Ini penting agar normalisasi (berdasarkan MAX seluruh data) selalu akurat
     $engine  = new SawEngine($db);
     $updated = $engine->hitungUlangSemua();
 
     $db->commit();
 
-    // Ambil skor hasil hitungan untuk perangkat ini
+    // Ambil skor hasil untuk perangkat ini
     $stmtSkor = $db->prepare("
         SELECT skor_akhir, rekomendasi
         FROM penilaian_spk
-        WHERE perangkat_id = :pid
-        ORDER BY tanggal_penilaian DESC
-        LIMIT 1
+        WHERE id = :pid
     ");
-    $stmtSkor->execute([':pid' => $perangkatId]);
+    $stmtSkor->execute([':pid' => $penilaianId]);
     $hasilSkor = $stmtSkor->fetch();
 
     $skor = number_format((float)($hasilSkor['skor_akhir'] ?? 0), 4);
@@ -132,7 +145,7 @@ try {
     );
 
 } catch (\PDOException $e) {
-    $db->rollBack();
+    if ($db->inTransaction()) $db->rollBack();
     error_log('[Penilaian Action] ' . $e->getMessage());
     redirectFlash('penilaian', 'error', 'Gagal menyimpan penilaian. Silakan coba lagi.');
 }

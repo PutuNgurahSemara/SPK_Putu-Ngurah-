@@ -1,30 +1,40 @@
 <?php
 // ============================================================
-// lib/SawEngine.php — Engine Perhitungan Metode SAW
-// Bobot diambil DINAMIS dari tabel `kriteria` (tidak hardcoded)
+// lib/SawEngine.php — Engine Perhitungan Metode SAW (v2 Dinamis)
+// Bobot & daftar kriteria diambil DINAMIS dari tabel `kriteria`
+// Nilai per-kriteria diambil dari tabel `penilaian_detail` (EAV)
 // ============================================================
 declare(strict_types=1);
 
 class SawEngine
 {
     private \PDO  $db;
-    private array $bobot;       // ['c1_usia' => 0.15, ...]
-    private float $threshold;   // default 0.70
-
-    // Kolom kriteria yang dihitung (urutan harus sama dengan kode C1–C5)
-    private const KOLOM_KRITERIA = [
-        'c1_usia',
-        'c2_kerusakan',
-        'c3_part',
-        'c4_kompleksitas',
-        'c5_garansi',
-    ];
+    private array $bobot;        // [kriteria_id => bobot_float]
+    private array $kriteriaIds;  // [kriteria_id, ...]
+    private float $threshold;
 
     public function __construct(\PDO $db)
     {
         $this->db        = $db;
-        $this->bobot     = getBobotKriteria();   // ambil dari DB, bukan hardcode
-        $this->threshold = SAW_THRESHOLD;         // konstanta dari koneksi.php (0.70)
+        $this->threshold = SAW_THRESHOLD;
+        $this->loadKriteria();
+    }
+
+    // ── PRIVATE: Muat daftar kriteria & bobot dari DB ──────────
+    private function loadKriteria(): void
+    {
+        $rows = $this->db->query(
+            "SELECT id, bobot FROM kriteria ORDER BY urutan, kode_kriteria ASC"
+        )->fetchAll(\PDO::FETCH_ASSOC);
+
+        $this->bobot       = [];
+        $this->kriteriaIds = [];
+
+        foreach ($rows as $r) {
+            $id = (int)$r['id'];
+            $this->bobot[$id]    = (float)$r['bobot'];
+            $this->kriteriaIds[] = $id;
+        }
     }
 
     // ── PUBLIC: Hitung ulang SEMUA baris penilaian_spk ────────
@@ -40,40 +50,65 @@ class SawEngine
      */
     public function hitungUlangSemua(): int
     {
-        // 1. Ambil semua data penilaian
-        $allData = $this->db
-            ->query("SELECT id, c1_usia, c2_kerusakan, c3_part, c4_kompleksitas, c5_garansi
-                     FROM penilaian_spk")
-            ->fetchAll(\PDO::FETCH_ASSOC);
-
-        if (empty($allData)) {
+        if (empty($this->kriteriaIds)) {
             return 0;
         }
 
-        // 2. Cari nilai MAX tiap kolom kriteria
-        $maxKolom = $this->hitungMax($allData);
+        // 1. Ambil semua penilaian
+        $allPenilaian = $this->db
+            ->query("SELECT id FROM penilaian_spk")
+            ->fetchAll(\PDO::FETCH_ASSOC);
 
-        // 3. Siapkan statement UPDATE
+        if (empty($allPenilaian)) {
+            return 0;
+        }
+
+        // 2. Ambil semua nilai detail
+        $allDetail = $this->db
+            ->query("SELECT penilaian_id, kriteria_id, nilai FROM penilaian_detail")
+            ->fetchAll(\PDO::FETCH_ASSOC);
+
+        // Kelompokkan: nilaiMap[penilaian_id][kriteria_id] = nilai
+        $nilaiMap = [];
+        foreach ($allDetail as $d) {
+            $nilaiMap[(int)$d['penilaian_id']][(int)$d['kriteria_id']] = (float)$d['nilai'];
+        }
+
+        // 3. Cari nilai MAX tiap kriteria dari semua penilaian
+        $maxKriteria = array_fill_keys($this->kriteriaIds, 0.0);
+        foreach ($nilaiMap as $values) {
+            foreach ($this->kriteriaIds as $kid) {
+                $val = $values[$kid] ?? 0.0;
+                if ($val > $maxKriteria[$kid]) {
+                    $maxKriteria[$kid] = $val;
+                }
+            }
+        }
+
+        // 4. Siapkan statement UPDATE
         $stmt = $this->db->prepare("
             UPDATE penilaian_spk
-               SET skor_akhir   = :skor,
-                   rekomendasi  = :rek
+               SET skor_akhir  = :skor,
+                   rekomendasi = :rek
              WHERE id = :id
         ");
 
         $updated = 0;
 
-        foreach ($allData as $row) {
-            // 4. Normalisasi & hitung V_i
-            $skor = $this->hitungSkor($row, $maxKolom);
+        foreach ($allPenilaian as $p) {
+            $pid    = (int)$p['id'];
+            $values = $nilaiMap[$pid] ?? [];
 
-            // 5. Tentukan rekomendasi berdasarkan threshold
+            // 5. Hitung V_i = Σ (w_j * r_ij)
+            $skor = $this->hitungSkor($values, $maxKriteria);
+
+            // 6. Tentukan rekomendasi
             $rekomendasi = ($skor >= $this->threshold) ? 'Masuk Gudang' : 'Servis';
 
             $stmt->execute([
                 ':skor' => round($skor, 4),
                 ':rek'  => $rekomendasi,
-                ':id'   => (int) $row['id'],
+                ':id'   => $pid,
             ]);
 
             $updated++;
@@ -82,91 +117,92 @@ class SawEngine
         return $updated;
     }
 
-    // ── PUBLIC: Hitung skor untuk 1 set nilai (preview sebelum simpan) ─
+    // ── PUBLIC: Preview skor untuk 1 set nilai (tanpa simpan) ──
     /**
      * Menghitung skor SAW untuk satu baris nilai tanpa menyentuh database.
      * Berguna untuk preview real-time di form penilaian.
      *
-     * @param array $nilaiBaru ['c1_usia'=>2, 'c2_kerusakan'=>3, ...]
-     * @return array ['skor' => 0.7833, 'rekomendasi' => 'Masuk Gudang', 'detail' => [...]]
+     * @param array<int, int> $nilaiBaru [kriteria_id => nilai (1-3)]
+     * @return array ['skor'=>float, 'rekomendasi'=>string, 'detail'=>array]
      */
     public function previewSkor(array $nilaiBaru): array
     {
-        // Ambil semua data + tambahkan baris baru untuk perhitungan MAX
-        $allData = $this->db
-            ->query("SELECT c1_usia, c2_kerusakan, c3_part, c4_kompleksitas, c5_garansi
-                     FROM penilaian_spk")
+        // Ambil semua detail existing untuk menghitung MAX yang akurat
+        $allDetail = $this->db
+            ->query("SELECT penilaian_id, kriteria_id, nilai FROM penilaian_detail")
             ->fetchAll(\PDO::FETCH_ASSOC);
 
-        $allData[] = $nilaiBaru; // gabungkan baris baru untuk menentukan MAX
-        $maxKolom  = $this->hitungMax($allData);
+        $allValues = [];
+        foreach ($allDetail as $d) {
+            $allValues[(int)$d['penilaian_id']][(int)$d['kriteria_id']] = (float)$d['nilai'];
+        }
+        $allValues['preview'] = $nilaiBaru; // sertakan baris baru
 
-        $skor        = $this->hitungSkor($nilaiBaru, $maxKolom);
-        $rekomendasi = ($skor >= $this->threshold) ? 'Masuk Gudang' : 'Servis';
+        // Hitung MAX
+        $maxKriteria = array_fill_keys($this->kriteriaIds, 0.0);
+        foreach ($allValues as $values) {
+            foreach ($this->kriteriaIds as $kid) {
+                $val = (float)($values[$kid] ?? 0);
+                if ($val > $maxKriteria[$kid]) {
+                    $maxKriteria[$kid] = $val;
+                }
+            }
+        }
 
-        // Rincian normalisasi per kriteria (untuk transparansi)
+        $skor   = 0.0;
         $detail = [];
-        foreach (self::KOLOM_KRITERIA as $kolom) {
-            $nilai   = (float) ($nilaiBaru[$kolom] ?? 0);
-            $max     = $maxKolom[$kolom] ?: 1;
-            $norm    = $nilai / $max;
-            $bobot   = $this->bobot[$kolom] ?? 0;
-            $kontrib = $norm * $bobot;
 
-            $detail[$kolom] = [
-                'nilai'    => $nilai,
-                'max'      => $max,
-                'norm'     => round($norm, 4),
-                'bobot'    => $bobot,
-                'kontrib'  => round($kontrib, 4),
+        foreach ($this->kriteriaIds as $kid) {
+            $nilai   = (float)($nilaiBaru[$kid] ?? 0);
+            $max     = $maxKriteria[$kid] ?: 1.0;
+            $norm    = $nilai / $max;
+            $bobot   = $this->bobot[$kid] ?? 0.0;
+            $kontrib = $norm * $bobot;
+            $skor   += $kontrib;
+
+            $detail[$kid] = [
+                'nilai'   => $nilai,
+                'max'     => $max,
+                'norm'    => round($norm, 4),
+                'bobot'   => $bobot,
+                'kontrib' => round($kontrib, 4),
             ];
         }
 
         return [
             'skor'        => round($skor, 4),
-            'rekomendasi' => $rekomendasi,
+            'rekomendasi' => ($skor >= $this->threshold) ? 'Masuk Gudang' : 'Servis',
             'detail'      => $detail,
             'threshold'   => $this->threshold,
         ];
     }
 
-    // ── PRIVATE: Cari nilai MAX tiap kolom ────────────────────
-    private function hitungMax(array $data): array
-    {
-        $max = array_fill_keys(self::KOLOM_KRITERIA, 0);
-
-        foreach ($data as $row) {
-            foreach (self::KOLOM_KRITERIA as $kolom) {
-                $val = (float) ($row[$kolom] ?? 0);
-                if ($val > $max[$kolom]) {
-                    $max[$kolom] = $val;
-                }
-            }
-        }
-
-        return $max;
-    }
-
     // ── PRIVATE: Hitung V_i = Σ (w_j * r_ij) ─────────────────
-    private function hitungSkor(array $row, array $maxKolom): float
+    private function hitungSkor(array $values, array $maxKriteria): float
     {
         $skor = 0.0;
 
-        foreach (self::KOLOM_KRITERIA as $kolom) {
-            $nilai = (float) ($row[$kolom] ?? 0);
-            $max   = $maxKolom[$kolom] ?: 1; // hindari division by zero
-            $bobot = $this->bobot[$kolom]  ?? 0;
-
+        foreach ($this->kriteriaIds as $kid) {
+            $nilai = $values[$kid]          ?? 0.0;
+            $max   = $maxKriteria[$kid]     ?: 1.0; // hindari division by zero
+            $bobot = $this->bobot[$kid]     ?? 0.0;
             $skor += ($nilai / $max) * $bobot;
         }
 
         return $skor;
     }
 
-    // ── PUBLIC: Getter bobot (untuk ditampilkan di UI) ────────
+    // ── PUBLIC: Getter ─────────────────────────────────────────
+    /** @return array<int, float> [kriteria_id => bobot] */
     public function getBobot(): array
     {
         return $this->bobot;
+    }
+
+    /** @return array<int> Daftar kriteria_id aktif */
+    public function getKriteriaIds(): array
+    {
+        return $this->kriteriaIds;
     }
 
     public function getThreshold(): float

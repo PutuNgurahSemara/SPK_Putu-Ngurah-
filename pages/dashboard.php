@@ -1,58 +1,59 @@
 <?php
 // ============================================================
-// pages/dashboard.php — Halaman Dashboard Utama
-// Menampilkan ringkasan statistik dan distribusi data SPK
+// pages/dashboard.php — Halaman Dashboard Utama (v2 Dinamis)
+// Rata-rata nilai per kriteria diambil dari penilaian_detail
 // ============================================================
 declare(strict_types=1);
 
 $db = getDB();
 
 // ── Query Statistik Utama ──────────────────────────────────
-$stmtTotal = $db->query("SELECT COUNT(*) AS total FROM penilaian_spk");
-$totalDinilai = (int) $stmtTotal->fetchColumn();
-
-$stmtServis = $db->query("SELECT COUNT(*) FROM penilaian_spk WHERE rekomendasi = 'Servis'");
-$totalServis = (int) $stmtServis->fetchColumn();
-
-$stmtGudang = $db->query("SELECT COUNT(*) FROM penilaian_spk WHERE rekomendasi = 'Masuk Gudang'");
-$totalGudang = (int) $stmtGudang->fetchColumn();
-
+$totalDinilai       = (int)$db->query("SELECT COUNT(*) FROM penilaian_spk")->fetchColumn();
+$totalServis        = (int)$db->query("SELECT COUNT(*) FROM penilaian_spk WHERE rekomendasi = 'Servis'")->fetchColumn();
+$totalGudang        = (int)$db->query("SELECT COUNT(*) FROM penilaian_spk WHERE rekomendasi = 'Masuk Gudang'")->fetchColumn();
 $totalBelumDihitung = $totalDinilai - $totalServis - $totalGudang;
 
 // ── Distribusi per Jenis Perangkat ────────────────────────
-$stmtJenis = $db->query("
+$distribusiJenis = $db->query("
     SELECT p.jenis_perangkat,
-           COUNT(ps.id)                                                     AS total,
-           COUNT(ps.id) FILTER (WHERE ps.rekomendasi = 'Servis')            AS servis,
-           COUNT(ps.id) FILTER (WHERE ps.rekomendasi = 'Masuk Gudang')      AS gudang
+           COUNT(ps.id)                                                  AS total,
+           COUNT(ps.id) FILTER (WHERE ps.rekomendasi = 'Servis')         AS servis,
+           COUNT(ps.id) FILTER (WHERE ps.rekomendasi = 'Masuk Gudang')   AS gudang
     FROM perangkat p
     LEFT JOIN penilaian_spk ps ON ps.perangkat_id = p.id
     GROUP BY p.jenis_perangkat
     ORDER BY total DESC
-");
-$distribusiJenis = $stmtJenis->fetchAll();
+")->fetchAll();
 
 // ── 5 Penilaian Terbaru ───────────────────────────────────
-$stmtRecent = $db->query("
+$recentPenilaian = $db->query("
     SELECT p.kode_aset, p.jenis_perangkat, p.divisi_user,
            ps.skor_akhir, ps.rekomendasi, ps.tanggal_penilaian
     FROM penilaian_spk ps
     JOIN perangkat p ON p.id = ps.perangkat_id
     ORDER BY ps.tanggal_penilaian DESC
     LIMIT 5
-");
-$recentPenilaian = $stmtRecent->fetchAll();
+")->fetchAll();
 
-// ── Rata-rata Skor Per Kriteria ───────────────────────────
-$stmtAvg = $db->query("
-    SELECT ROUND(AVG(c1_usia)::numeric, 2)         AS avg_c1,
-           ROUND(AVG(c2_kerusakan)::numeric, 2)     AS avg_c2,
-           ROUND(AVG(c3_part)::numeric, 2)           AS avg_c3,
-           ROUND(AVG(c4_kompleksitas)::numeric, 2)   AS avg_c4,
-           ROUND(AVG(c5_garansi)::numeric, 2)        AS avg_c5
-    FROM penilaian_spk
-");
-$avgKriteria = $stmtAvg->fetch();
+// ── Rata-rata Nilai per Kriteria (dari penilaian_detail) ──
+$semuaKriteria = getAllKriteria();
+$avgKriteria   = []; // [kriteria_id => avg_nilai]
+
+if ($totalDinilai > 0 && !empty($semuaKriteria)) {
+    $avgRows = $db->query("
+        SELECT kriteria_id, ROUND(AVG(nilai)::numeric, 2) AS avg_nilai
+        FROM penilaian_detail
+        GROUP BY kriteria_id
+    ")->fetchAll();
+    foreach ($avgRows as $ar) {
+        $avgKriteria[(int)$ar['kriteria_id']] = (float)$ar['avg_nilai'];
+    }
+}
+
+$barColors = ['bg-blue-500','bg-red-500','bg-amber-500','bg-purple-500','bg-emerald-500',
+              'bg-cyan-500','bg-rose-500','bg-lime-500','bg-indigo-500','bg-orange-500'];
+$textColors = ['text-blue-400','text-red-400','text-amber-400','text-purple-400','text-emerald-400',
+               'text-cyan-400','text-rose-400','text-lime-400','text-indigo-400','text-orange-400'];
 ?>
 
 <!-- ── Stat Cards ─────────────────────────────────────── -->
@@ -89,7 +90,7 @@ $avgKriteria = $stmtAvg->fetch();
         <div>
             <p class="text-slate-400 text-xs font-medium uppercase tracking-wide">Rekomendasi Servis</p>
             <p class="text-3xl font-extrabold text-amber-400 mt-0.5"><?= $totalServis ?></p>
-            <p class="text-slate-500 text-xs mt-0.5">Skor &lt; 0.70</p>
+            <p class="text-slate-500 text-xs mt-0.5">Skor &lt; <?= SAW_THRESHOLD ?></p>
         </div>
     </div>
 
@@ -106,7 +107,7 @@ $avgKriteria = $stmtAvg->fetch();
         <div>
             <p class="text-slate-400 text-xs font-medium uppercase tracking-wide">Masuk Gudang</p>
             <p class="text-3xl font-extrabold text-red-400 mt-0.5"><?= $totalGudang ?></p>
-            <p class="text-slate-500 text-xs mt-0.5">Skor &ge; 0.70</p>
+            <p class="text-slate-500 text-xs mt-0.5">Skor &ge; <?= SAW_THRESHOLD ?></p>
         </div>
     </div>
 
@@ -146,9 +147,6 @@ $avgKriteria = $stmtAvg->fetch();
 
         <?php if (empty($distribusiJenis)): ?>
             <div class="flex flex-col items-center justify-center py-10 text-slate-500">
-                <svg class="w-10 h-10 mb-2 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"/>
-                </svg>
                 <p class="text-sm">Belum ada data perangkat</p>
             </div>
         <?php else: ?>
@@ -163,9 +161,9 @@ $avgKriteria = $stmtAvg->fetch();
             $maxTotal = max(array_column($distribusiJenis, 'total')) ?: 1;
 
             foreach ($distribusiJenis as $row):
-                $color   = $jenisColors[$row['jenis_perangkat']] ?? ['bar' => 'bg-slate-500', 'dot' => 'bg-slate-400'];
-                $pct     = round(($row['total'] / $maxTotal) * 100);
-                $pctBar  = max(4, $pct); // minimal 4% agar bar terlihat
+                $color  = $jenisColors[$row['jenis_perangkat']] ?? ['bar' => 'bg-slate-500', 'dot' => 'bg-slate-400'];
+                $pct    = round(($row['total'] / $maxTotal) * 100);
+                $pctBar = max(4, $pct);
             ?>
             <div>
                 <div class="flex items-center justify-between mb-1.5">
@@ -205,7 +203,7 @@ $avgKriteria = $stmtAvg->fetch();
         <?php else: ?>
             <div class="space-y-3">
             <?php foreach ($recentPenilaian as $r):
-                $isGudang = $r['rekomendasi'] === 'Masuk Gudang';
+                $isGudang   = $r['rekomendasi'] === 'Masuk Gudang';
                 $badgeClass = $isGudang
                     ? 'bg-red-900/50 text-red-300 border border-red-700/50'
                     : 'bg-amber-900/50 text-amber-300 border border-amber-700/50';
@@ -214,7 +212,9 @@ $avgKriteria = $stmtAvg->fetch();
             <div class="flex items-center justify-between gap-2 py-2.5 border-b border-slate-700/40 last:border-0">
                 <div class="min-w-0">
                     <p class="text-slate-200 text-xs font-semibold truncate"><?= htmlspecialchars($r['kode_aset']) ?></p>
-                    <p class="text-slate-500 text-[10px] truncate"><?= htmlspecialchars($r['jenis_perangkat']) ?> &mdash; <?= htmlspecialchars($r['divisi_user']) ?></p>
+                    <p class="text-slate-500 text-[10px] truncate">
+                        <?= htmlspecialchars($r['jenis_perangkat']) ?> &mdash; <?= htmlspecialchars($r['divisi_user']) ?>
+                    </p>
                 </div>
                 <div class="flex items-center gap-2 flex-shrink-0">
                     <span class="text-slate-300 text-xs font-mono"><?= $skor ?></span>
@@ -231,31 +231,31 @@ $avgKriteria = $stmtAvg->fetch();
     </div>
 </div>
 
-<!-- ── Rata-rata Kriteria ──────────────────────────────── -->
-<?php if ($totalDinilai > 0): ?>
+<!-- ── Rata-rata Nilai per Kriteria (Dinamis) ─────────── -->
+<?php if ($totalDinilai > 0 && !empty($semuaKriteria)): ?>
 <div class="bg-slate-800 border border-slate-700/60 rounded-2xl p-5">
     <div class="mb-5">
         <h2 class="text-white font-semibold text-sm">Rata-rata Nilai per Kriteria</h2>
-        <p class="text-slate-500 text-xs mt-0.5">Dari seluruh <?= $totalDinilai ?> data penilaian (skala 1–3)</p>
+        <p class="text-slate-500 text-xs mt-0.5">
+            Dari seluruh <?= $totalDinilai ?> data penilaian (skala 1–3)
+        </p>
     </div>
-    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
-        <?php
-        $kriteriaInfo = [
-            ['label' => 'C1 Usia',         'key' => 'avg_c1', 'color' => 'text-blue-400',   'bg' => 'bg-blue-500'],
-            ['label' => 'C2 Kerusakan',    'key' => 'avg_c2', 'color' => 'text-red-400',    'bg' => 'bg-red-500'],
-            ['label' => 'C3 Suku Cadang',  'key' => 'avg_c3', 'color' => 'text-amber-400',  'bg' => 'bg-amber-500'],
-            ['label' => 'C4 Kompleksitas', 'key' => 'avg_c4', 'color' => 'text-purple-400', 'bg' => 'bg-purple-500'],
-            ['label' => 'C5 Garansi',      'key' => 'avg_c5', 'color' => 'text-emerald-400','bg' => 'bg-emerald-500'],
-        ];
-        foreach ($kriteriaInfo as $k):
-            $val  = (float)($avgKriteria[$k['key']] ?? 0);
+    <div class="grid gap-4" style="grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));">
+        <?php foreach ($semuaKriteria as $i => $kr):
+            $kid  = (int)$kr['id'];
+            $val  = $avgKriteria[$kid] ?? 0.0;
             $pct  = round(($val / 3) * 100);
+            $color = $barColors[$i % count($barColors)];
+            $tcolor = $textColors[$i % count($textColors)];
         ?>
         <div class="bg-slate-700/40 rounded-xl p-4 text-center">
-            <p class="text-slate-400 text-xs font-medium mb-2"><?= $k['label'] ?></p>
-            <p class="text-2xl font-bold <?= $k['color'] ?>"><?= number_format($val, 2) ?></p>
+            <p class="text-slate-400 text-xs font-medium mb-0.5"><?= htmlspecialchars($kr['kode_kriteria']) ?></p>
+            <p class="text-slate-500 text-[10px] mb-2 truncate" title="<?= htmlspecialchars($kr['nama_kriteria']) ?>">
+                <?= htmlspecialchars($kr['nama_kriteria']) ?>
+            </p>
+            <p class="text-2xl font-bold <?= $tcolor ?>"><?= number_format($val, 2) ?></p>
             <div class="mt-2 h-1.5 bg-slate-600 rounded-full overflow-hidden">
-                <div class="h-full <?= $k['bg'] ?> rounded-full"
+                <div class="h-full <?= $color ?> rounded-full"
                      style="width: <?= $pct ?>%"></div>
             </div>
             <p class="text-slate-600 text-[10px] mt-1"><?= $pct ?>% dari maks</p>
